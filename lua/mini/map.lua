@@ -496,6 +496,7 @@ MiniMap.current = {
 ---     of |MiniMap.gen_encode_symbols.block()| with `'3x2'` identifier.
 ---
 ---@return table Array of encoded strings.
+---@return table Array of color masks.
 MiniMap.encode_strings = function(strings, opts)
   -- Validate input
   if not H.is_array_of(strings, H.is_string) then
@@ -510,8 +511,9 @@ MiniMap.encode_strings = function(strings, opts)
 
   -- Compute encoding
   local mask = H.mask_from_strings(strings, opts)
-  mask = H.mask_rescale(mask, opts)
-  return H.mask_to_symbols(mask, opts)
+  local color_mask = nil
+  mask, color_mask = H.mask_rescale(mask, opts)
+  return H.mask_to_symbols(mask, opts), color_mask
 end
 
 --- Open map window
@@ -920,6 +922,7 @@ H.cache = {
 }
 
 H.ns_id = {
+  color_blocks = vim.api.nvim_create_namespace('MiniMapBlocks'),
   integrations = vim.api.nvim_create_namespace('MiniMapIntegrations'),
   scroll_view = vim.api.nvim_create_namespace('MiniMapScrollView'),
   scroll_line = vim.api.nvim_create_namespace('MiniMapScrollLine'),
@@ -1121,6 +1124,8 @@ end
 ---@param mask table Boolean 2d array.
 ---@return table Boolean 2d array rescaled to be shown by symbols:
 ---   `opts.n_rows` lines and `opts.n_cols` within a row.
+---@return table 2d array of mixed Boolean and Numeric values: `false` if no
+---   color is present or Numeric value representing the block's syntax id.
 ---@private
 H.mask_rescale = function(mask, opts)
   -- Infer output number of rows and columns. Should be multiples of
@@ -1150,17 +1155,39 @@ H.mask_rescale = function(mask, opts)
     res[i] = H.tbl_repeat(false, n_cols)
   end
 
+  -- Create a table with the minimum display dimensions required to cover the
+  -- character blocks
+  local n_rows_color = math.min(math.ceil(source_rows / resolution.row), opts.n_rows)
+  local n_cols_color = math.min(math.ceil(source_cols / resolution.col), opts.n_cols)
+  local color_res = {}
+  for i = 1, n_rows_color do
+    color_res[i] = H.tbl_repeat(false, n_cols_color)
+  end
+
   local rows_coeff, cols_coeff = n_rows / source_rows, n_cols / source_cols
+  local rows_coeff_color, cols_coeff_color = n_rows_color / source_rows, n_cols_color / source_cols
+  local syn_id = 0 -- highlight group syntax id
 
   for i, m_row in ipairs(mask) do
     for j, m in ipairs(m_row) do
       local res_i = math.floor((i - 1) * rows_coeff) + 1
       local res_j = math.floor((j - 1) * cols_coeff) + 1
       res[res_i][res_j] = m or res[res_i][res_j]
+
+      -- If there is a character and we have no color yet
+      -- extract it if it isn't the default
+      res_i = math.floor((i - 1) * rows_coeff_color) + 1
+      res_j = math.floor((j - 1) * cols_coeff_color) + 1
+      if m and not color_res[res_i][res_j] then
+        syn_id = vim.fn.synID(i, j, 1)
+        if syn_id ~= 0 then
+          color_res[res_i][res_j] = syn_id
+        end
+      end
     end
   end
 
-  return res
+  return res, color_res
 end
 
 --- Convert extended map mask to strings. Each bin with resolution dimensions
@@ -1397,7 +1424,7 @@ H.update_map_lines = function()
 
   local encode_symbols = opts.symbols.encode or H.default_symbols
   local source_rows, scrollbar_prefix = #buf_lines, string.rep(' ', offset)
-  local encoded_lines, rescaled_rows, resolution_row
+  local encoded_lines, rescaled_rows, resolution_row, color_mask
   if n_cols <= 0 then
     -- Case of "only scroll indicator". Needed to make scrollbar correctly
     -- travel from buffer top to bottom.
@@ -1408,7 +1435,7 @@ H.update_map_lines = function()
   else
     -- Case of "full map"
     local encode_opts = { n_cols = n_cols, n_rows = n_rows, symbols = encode_symbols }
-    encoded_lines = MiniMap.encode_strings(buf_lines, encode_opts)
+    encoded_lines, color_mask = MiniMap.encode_strings(buf_lines, encode_opts)
 
     -- Add whitespace for scrollbar
     encoded_lines = vim.tbl_map(function(x) return string.format('%s%s', scrollbar_prefix, x) end, encoded_lines)
@@ -1420,6 +1447,23 @@ H.update_map_lines = function()
 
   -- Set map lines. Compute encode data in a way used in mask rescaling
   vim.api.nvim_buf_set_lines(buf_id, 0, -1, true, encoded_lines)
+
+  -- Color each block
+  local ns_id = H.ns_id.color_blocks
+  local offset = H.cache.scrollbar_data.offset
+  local line
+  for i, m_row in ipairs(color_mask) do
+    line = i -1
+    for j, m in ipairs(m_row) do
+      if m then
+        H.set_extmark_safely(buf_id, ns_id, line, offset +j*3 -1, {
+          hl_group = m,
+          end_row = line,
+          end_col = offset +j*3,
+        })
+      end
+    end
+  end
 
   -- Cache encode data to speed up most frequent scrollbar computation
   H.cache.encode_data = {
